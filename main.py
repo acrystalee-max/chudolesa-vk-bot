@@ -117,6 +117,12 @@ def init_db() -> None:
                 sent_count INTEGER NOT NULL DEFAULT 0,
                 failed_count INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS admin_states (
+                admin_id INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -198,6 +204,33 @@ def delete_draft(admin_id: int) -> None:
         connection.execute("DELETE FROM drafts WHERE admin_id = ?", (admin_id,))
 
 
+def set_admin_state(admin_id: int, state: str) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO admin_states (admin_id, state, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(admin_id) DO UPDATE SET
+                state = excluded.state,
+                created_at = excluded.created_at
+            """,
+            (admin_id, state, utc_now()),
+        )
+
+
+def get_admin_state(admin_id: int) -> str:
+    with db_connect() as connection:
+        row = connection.execute(
+            "SELECT state FROM admin_states WHERE admin_id = ?", (admin_id,)
+        ).fetchone()
+    return str(row["state"]) if row else ""
+
+
+def clear_admin_state(admin_id: int) -> None:
+    with db_connect() as connection:
+        connection.execute("DELETE FROM admin_states WHERE admin_id = ?", (admin_id,))
+
+
 def start_campaign(admin_id: int, message: str, attachments: str) -> int:
     with db_connect() as connection:
         cursor = connection.execute(
@@ -230,14 +263,28 @@ def record_delivery_error(user_id: int, error: str) -> None:
         )
 
 
-def main_keyboard() -> str:
+def start_keyboard() -> str:
     keyboard = VkKeyboard(one_time=False)
-    keyboard.add_button("Подписаться", color=VkKeyboardColor.POSITIVE)
+    keyboard.add_button("Начать", color=VkKeyboardColor.POSITIVE)
+    return keyboard.get_keyboard()
+
+
+def subscribed_keyboard() -> str:
+    keyboard = VkKeyboard(one_time=False)
     keyboard.add_button("Отписаться", color=VkKeyboardColor.NEGATIVE)
     return keyboard.get_keyboard()
 
 
-def send_message(vk, peer_id: int, message: str, attachment: str = "") -> None:
+def draft_confirmation_keyboard() -> str:
+    keyboard = VkKeyboard(one_time=True)
+    keyboard.add_button("/отправить", color=VkKeyboardColor.POSITIVE)
+    keyboard.add_button("/отмена", color=VkKeyboardColor.NEGATIVE)
+    return keyboard.get_keyboard()
+
+
+def send_message(
+    vk, peer_id: int, message: str, attachment: str = "", keyboard: str = ""
+) -> None:
     params = {
         "peer_id": peer_id,
         "random_id": random.randint(1, 2_147_483_647),
@@ -245,6 +292,8 @@ def send_message(vk, peer_id: int, message: str, attachment: str = "") -> None:
     }
     if attachment:
         params["attachment"] = attachment
+    if keyboard:
+        params["keyboard"] = keyboard
     vk.messages.send(**params)
 
 
@@ -279,7 +328,7 @@ def attachments_to_vk_string(attachments) -> str:
 def user_help_text() -> str:
     return (
         "Я бот сообщества «Чудо леса» 🌿\n\n"
-        "Нажмите «Подписаться», чтобы получать новости о свечах, декоре "
+        "Нажмите «Начать», чтобы подписаться и получать новости о свечах, декоре "
         "и мастер-классах. Отказаться можно в любой момент кнопкой «Отписаться»."
     )
 
@@ -301,7 +350,7 @@ def welcome_message() -> str:
 def admin_help_text() -> str:
     return (
         "Команды администратора:\n"
-        "• /рассылка Текст — подготовить рассылку. Можно приложить фото.\n"
+        "• /рассылка — начать подготовку рассылки; затем пришлите текст или фото.\n"
         "• /отправить — отправить подготовленную рассылку.\n"
         "• /отмена — удалить черновик.\n"
         "• /статистика — показать число подписчиков.\n\n"
@@ -310,6 +359,21 @@ def admin_help_text() -> str:
 
 
 broadcast_lock = threading.Lock()
+
+
+def save_and_preview_draft(
+    vk, admin_id: int, message: str, attachments: str
+) -> None:
+    save_draft(admin_id, message, attachments)
+    clear_admin_state(admin_id)
+    preview_text = "Черновик рассылки:\n\n" + (message or "(только вложение)")
+    send_message(vk, admin_id, preview_text, attachments)
+    send_message(
+        vk,
+        admin_id,
+        "Если всё верно, нажмите /отправить.\nДля отмены — /отмена",
+        keyboard=draft_confirmation_keyboard(),
+    )
 
 
 def run_broadcast(vk, admin_id: int, message: str, attachments: str) -> None:
@@ -348,7 +412,7 @@ def run_broadcast(vk, admin_id: int, message: str, attachments: str) -> None:
 def handle_admin_command(vk, admin_id: int, text: str, attachments: str) -> bool:
     lowered = text.lower()
 
-    if lowered == "/статистика":
+    if lowered in {"/статистика", "статистика"}:
         active_count, total_count = subscriber_counts()
         send_message(
             vk,
@@ -357,16 +421,17 @@ def handle_admin_command(vk, admin_id: int, text: str, attachments: str) -> bool
         )
         return True
 
-    if lowered == "/помощь":
+    if lowered in {"/помощь", "помощь"}:
         send_message(vk, admin_id, admin_help_text())
         return True
 
-    if lowered == "/отмена":
+    if lowered in {"/отмена", "отмена"}:
         delete_draft(admin_id)
+        clear_admin_state(admin_id)
         send_message(vk, admin_id, "Черновик удалён.")
         return True
 
-    if lowered == "/отправить":
+    if lowered in {"/отправить", "отправить"}:
         draft = get_draft(admin_id)
         if draft is None:
             send_message(vk, admin_id, "Черновика нет. Сначала используйте /рассылка Текст")
@@ -380,24 +445,30 @@ def handle_admin_command(vk, admin_id: int, text: str, attachments: str) -> bool
         ).start()
         return True
 
-    if lowered == "/рассылка" or lowered.startswith("/рассылка "):
-        message = text[len("/рассылка") :].strip()
-        if not message and not attachments:
+    if lowered in {"/рассылка", "рассылка"}:
+        if attachments:
+            save_and_preview_draft(vk, admin_id, "", attachments)
+        else:
+            set_admin_state(admin_id, "waiting_broadcast")
             send_message(
                 vk,
                 admin_id,
-                "Добавьте текст после команды или приложите фотографию.\n"
-                "Пример: /рассылка В субботу состоится мастер-класс!",
+                "Пришлите следующим сообщением текст рассылки.\n"
+                "К нему можно сразу приложить фотографию.",
             )
+        return True
+
+    for prefix in ("/рассылка ", "рассылка "):
+        if lowered.startswith(prefix):
+            message = text[len(prefix) :].strip()
+            save_and_preview_draft(vk, admin_id, message, attachments)
             return True
-        save_draft(admin_id, message, attachments)
-        preview_text = "Черновик рассылки:\n\n" + (message or "(только вложение)")
-        send_message(vk, admin_id, preview_text, attachments)
-        send_message(
-            vk,
-            admin_id,
-            "Если всё верно, отправьте /отправить\nДля отмены — /отмена",
-        )
+
+    if get_admin_state(admin_id) == "waiting_broadcast":
+        if not text and not attachments:
+            send_message(vk, admin_id, "Пришлите текст или фотографию для рассылки.")
+            return True
+        save_and_preview_draft(vk, admin_id, text, attachments)
         return True
 
     return False
@@ -453,7 +524,7 @@ def run() -> None:
                     peer_id=user_id,
                     random_id=random.randint(1, 2_147_483_647),
                     message=welcome_message(),
-                    keyboard=main_keyboard(),
+                    keyboard=subscribed_keyboard(),
                 )
             elif lowered in UNSUBSCRIBE_WORDS:
                 unsubscribe(user_id)
@@ -461,14 +532,14 @@ def run() -> None:
                     peer_id=user_id,
                     random_id=random.randint(1, 2_147_483_647),
                     message="Вы отписались от рассылки. Возвращайтесь, когда захотите 🌿",
-                    keyboard=main_keyboard(),
+                    keyboard=start_keyboard(),
                 )
             elif lowered in HELP_WORDS or not text:
                 vk.messages.send(
                     peer_id=user_id,
                     random_id=random.randint(1, 2_147_483_647),
                     message=user_help_text(),
-                    keyboard=main_keyboard(),
+                    keyboard=start_keyboard(),
                 )
             else:
                 vk.messages.send(
@@ -478,7 +549,7 @@ def run() -> None:
                         "Спасибо за сообщение! Выберите действие на клавиатуре ниже.\n\n"
                         + user_help_text()
                     ),
-                    keyboard=main_keyboard(),
+                    keyboard=start_keyboard(),
                 )
         except Exception:
             logger.exception("Ошибка при обработке сообщения от user_id=%s", user_id)
