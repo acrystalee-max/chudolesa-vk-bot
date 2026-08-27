@@ -31,6 +31,8 @@ VK_TOKEN = (
 GROUP_ID_RAW = os.getenv("GROUP_ID", "").strip()
 GROUP_SCREEN_NAME = os.getenv("GROUP_SCREEN_NAME", "chudolesa").strip()
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
+WELCOME_DISCOUNT_PERCENT = os.getenv("WELCOME_DISCOUNT_PERCENT", "5").strip()
+WELCOME_PROMO_CODE = os.getenv("WELCOME_PROMO_CODE", "ПОДАРОК").strip()
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DB_PATH = DATA_DIR / "subscribers.db"
 
@@ -282,6 +284,20 @@ def user_help_text() -> str:
     )
 
 
+def welcome_message() -> str:
+    return (
+        "Добро пожаловать в «Чудо леса» 🌿\n\n"
+        "Теперь вы будете получать наши новости о свечах, декоре "
+        "и мастер-классах.\n\n"
+        f"🎁 Спасибо за подписку! Дарим вам скидку {WELCOME_DISCOUNT_PERCENT}% "
+        "на первый заказ.\n"
+        f"Промокод: {WELCOME_PROMO_CODE}\n"
+        "Сообщите его нам при оформлении заказа.\n\n"
+        "Скидка действует один раз и не суммируется с другими предложениями.\n"
+        "Отписаться можно в любой момент."
+    )
+
+
 def admin_help_text() -> str:
     return (
         "Команды администратора:\n"
@@ -436,10 +452,7 @@ def run() -> None:
                 vk.messages.send(
                     peer_id=user_id,
                     random_id=random.randint(1, 2_147_483_647),
-                    message=(
-                        "Готово! Вы подписаны на новости «Чудо леса» 🌿\n"
-                        "Отписаться можно в любой момент."
-                    ),
+                    message=welcome_message(),
                     keyboard=main_keyboard(),
                 )
             elif lowered in UNSUBSCRIBE_WORDS:
