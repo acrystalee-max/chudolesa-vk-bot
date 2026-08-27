@@ -21,8 +21,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("chudolesa-bot")
 
-VK_TOKEN = os.getenv("VK_TOKEN", "").strip()
+VK_TOKEN = (
+    os.getenv("VK_TOKEN")
+    or os.getenv("VK_BOT_TOKEN")
+    or os.getenv("BOT_TOKEN")
+    or os.getenv("API_TOKEN")
+    or ""
+).strip()
 GROUP_ID_RAW = os.getenv("GROUP_ID", "").strip()
+GROUP_SCREEN_NAME = os.getenv("GROUP_SCREEN_NAME", "chudolesa").strip()
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DB_PATH = DATA_DIR / "subscribers.db"
@@ -48,19 +55,26 @@ def parse_admin_ids(raw: str) -> set[int]:
     return result
 
 
-def validate_config() -> tuple[int, set[int]]:
+def validate_config() -> set[int]:
     missing = []
     if not VK_TOKEN:
-        missing.append("VK_TOKEN")
-    if not GROUP_ID_RAW:
-        missing.append("GROUP_ID")
-    if not ADMIN_IDS_RAW:
-        missing.append("ADMIN_IDS")
+        missing.append("VK_TOKEN/BOT_TOKEN")
     if missing:
         raise RuntimeError(
             "Не заданы обязательные переменные окружения: " + ", ".join(missing)
         )
-    return int(GROUP_ID_RAW), parse_admin_ids(ADMIN_IDS_RAW)
+    return parse_admin_ids(ADMIN_IDS_RAW)
+
+
+def resolve_group_id(vk) -> int:
+    if GROUP_ID_RAW:
+        return int(GROUP_ID_RAW)
+    result = vk.utils.resolveScreenName(screen_name=GROUP_SCREEN_NAME)
+    if not result or result.get("type") != "group":
+        raise RuntimeError(
+            f"Не удалось определить сообщество по адресу {GROUP_SCREEN_NAME!r}"
+        )
+    return int(result["object_id"])
 
 
 def db_connect() -> sqlite3.Connection:
@@ -374,13 +388,19 @@ def handle_admin_command(vk, admin_id: int, text: str, attachments: str) -> bool
 
 
 def run() -> None:
-    group_id, admin_ids = validate_config()
+    admin_ids = validate_config()
     init_db()
 
     session = vk_api.VkApi(token=VK_TOKEN, api_version="5.199")
     vk = session.get_api()
+    group_id = resolve_group_id(vk)
     longpoll = VkBotLongPoll(session, group_id)
     logger.info("Бот запущен для сообщества %s", group_id)
+    if not admin_ids:
+        logger.warning(
+            "ADMIN_IDS пока не задан. Отправьте боту команду /мойid, "
+            "затем добавьте полученное число в переменную ADMIN_IDS."
+        )
 
     for event in longpoll.listen():
         if event.type != VkBotEventType.MESSAGE_NEW:
@@ -397,6 +417,15 @@ def run() -> None:
         attachments = attachments_to_vk_string(message.get("attachments", []))
 
         try:
+            if lowered in {"/мойid", "мой id", "мойid"}:
+                send_message(
+                    vk,
+                    user_id,
+                    f"Ваш числовой VK ID: {user_id}\n"
+                    "Сохраните это число для настройки администратора.",
+                )
+                continue
+
             if user_id in admin_ids and handle_admin_command(
                 vk, user_id, text, attachments
             ):
